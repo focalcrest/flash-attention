@@ -1,110 +1,98 @@
-# FlashAttention
+# FlashAttention V100 (SM70) 移植版
 
-## V100 (SM70) 项目专用说明
+我累了。
 
-本仓库是 FlashAttention 面向 **NVIDIA V100 (SM70)** 的移植分支，原版项目参考 `vllm-project/flash-attention`。  
-本分支核心目标是稳定支持 SM70，当前开发与调试请优先遵循以下流程。
+这个项目把 FlashAttention-2 移植到了 NVIDIA V100 (SM70) 上。目前前向性能已经比 TRITON_ATTN 快了，q8k 场景下快了 80%，而且直接能在 vllm 里跑起来。
 
-### 项目介绍
+![FLASH_ATTN vs TRITON_ATTN Benchmark](assets/微信图片_20260329164253_102497_5.png)
 
-这是一个 **FlashAttention-2（FA2）在 V100 上的工程化版本**，重点面向：
-- 在 `sm_70` 架构上实现可用、可维护的 FA2 前向/相关路径；
-- 结合本仓库现有测试矩阵持续收敛数值一致性问题；
-- 保留可追溯的调试记录，便于多人并行协作修复。
+![qwen3-coder-next on V100](assets/微信图片_20260329172146_102503_5.png)
 
-简要定位：
-- 上游基线：`vllm-project/flash-attention`
-- 当前分支：FA2 V100 适配与稳定性修复
-- 主要工作形态：CUDA 内核调优 + 数值对齐回归 + 案例化 debug
+## 使用方法
 
-### 1) 构建流程
-
-#### 推荐方式（项目内统一方式）
 ```bash
+uv venv --python 3.12
+source .venv/bin/activate
+uv pip install “cmake>=3.26.1” ninja “packaging>=24.2” “setuptools>=77.0.3,<81.0.0” wheel jinja2
+uv pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu128
+
+# 安装vllm
+uv pip install vllm==0.17.1 --torch-backend=cu128
+
+# 构建安装
 ./build.sh
 ```
 
-`build.sh` 已包含以下关键设置：
-- 激活 `.venv` 虚拟环境
-- 使用 `CUDA_HOME=/usr/local/cuda-12.8`
-- 开启 `ccache`，并设置上限 `100G`
-- 使用 `uv pip install --no-build-isolation . -v` 进行本地安装
+安装完成后，需要修改 vllm 的 flash_attn backend，让它支持 SM70：
 
-#### 构建注意事项
-- 构建非常耗时（常见 2 小时以上），请耐心等待。
-- **不要主动中断构建任务**，尤其在 `ptxas` 长时间静默阶段。
-- 遇到长时间无输出通常是正常现象，可低频轮询进程状态。
-
-### 2) 测试流程
-
-#### 全量测试入口
 ```bash
-./test.sh dense
-./test.sh sparse
+vi /path/to/.venv/lib/python3.12/site-packages/vllm/v1/attention/backends/flash_attn.py
 ```
 
-#### 常用定点测试（建议用于 debug）
-```bash
-CASE_IDS=119 ./test.sh dense
-CASE_IDS=183,184 ./test.sh dense
+找到 `supports_compute_capability` 方法，把 SM 版本检查从 8.0 改为 7.0：
+
+```python
+    @classmethod
+    def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
+-        return capability >= DeviceCapability(8, 0)
++        return capability >= DeviceCapability(7, 0)
 ```
 
-#### 测试说明
-- `dense`：覆盖数值对齐与 split-kv 路径。
-- `sparse`：覆盖稀疏相关路径。
-- 调试阶段建议先跑最小失败集（`CASE_IDS`），确认后再回归全量。
+然后正常启动 vllm 就可以了，默认会使用 FLASH_ATTN。
 
-### 3) 项目依赖
+---
 
-### 硬件 / 系统
-- NVIDIA Tesla V100（计算能力 `sm_70`）
-- Linux 环境
+希望有缘人继续优化吧，我爱你们。
 
-### CUDA / 编译工具
-- CUDA 12.8（路径约定：`/usr/local/cuda-12.8`）
-- `ccache`
-- `cmake >= 3.26.1`
-- `ninja`
+---
 
-### Python / 包依赖
-- Python 虚拟环境：`.venv`
-- `uv`
-- `torch == 2.10.0`
-- `packaging >= 24.2`
-- `setuptools >= 77.0.3, < 81.0.0`
-- `wheel`, `jinja2`
+# FlashAttention V100 (SM70) Port
 
-### 4) 测试状态
+I'm tired.
 
-以下为最近一次完整回归（2026-03-15）结果快照：
+This project ports FlashAttention-2 to NVIDIA V100 (SM70). The forward pass is now faster than TRITON_ATTN — 80% faster at q8k — and it runs directly with vllm.
 
-**所有测试用例均已通过！**
+![FLASH_ATTN vs TRITON_ATTN Benchmark](assets/微信图片_20260329164253_102497_5.png)
 
-- `dense` 测试：全部通过
-- `sparse` 测试：全部通过
-- `splitkv` 测试：`60/60 PASS`
+![qwen3-coder-next on V100](assets/微信图片_20260329172146_102503_5.png)
 
-项目已完成在 V100 (SM70) 上的 FA2 完整功能验证。
+## Usage
 
-### 5) 多开发者协作建议
+```bash
+uv venv --python 3.12
+source .venv/bin/activate
+uv pip install "cmake>=3.26.1" ninja "packaging>=24.2" "setuptools>=77.0.3,<81.0.0" wheel jinja2
+uv pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu128
 
-#### 分支与提交建议
-- 建议每个修复点单独分支，提交信息注明：
-  - 复现 case（如 `CASE_IDS=183`）
-  - 根因结论
-  - 回归范围（最小 case + 全量）
+# Install vllm
+uv pip install vllm==0.17.1 --torch-backend=cu128
 
-#### Debug 约定（强烈建议）
-- 采用“分段加 `printf` -> 小 case 验证 -> 扩大回归”的方式。
-- 通过代码修改确认的事实，请写入 `debug.md`（中文）。
-- 禁止通过跳过、屏蔽用例来规避未知问题，必须定位根因。
+# Build and install
+./build.sh
+```
 
-#### 典型排障顺序
-1. 用 `CASE_IDS` 复现最小失败。
-2. 先看是否出现 `NaN/Inf`，再看 `max_diff/mean_diff`。
-3. 对比 `local/alibi/causal` 组合，锁定触发条件。
-4. 增加最小范围内核日志，确认行/列索引与归约行为。
-5. 小范围通过后，回归 `./test.sh dense` 与 `./test.sh sparse`。
+After installation, patch vllm's flash_attn backend to support SM70:
+
+```bash
+vi /path/to/.venv/lib/python3.12/site-packages/vllm/v1/attention/backends/flash_attn.py
+```
+
+Find the `supports_compute_capability` method and change the SM version check from 8.0 to 7.0:
+
+```python
+    @classmethod
+    def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
+-        return capability >= DeviceCapability(8, 0)
++        return capability >= DeviceCapability(7, 0)
+```
+
+Then just start vllm normally — it will use FLASH_ATTN by default.
+
+---
+
+I hope someone out there will continue to optimize this. I love you all.
+
+---
 
 This repository provides the official implementation of FlashAttention and
 FlashAttention-2 from the
