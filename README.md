@@ -2,15 +2,18 @@
 
 我累了。
 
-这个项目把 FlashAttention-2 移植到了 NVIDIA V100 (SM70) 上。目前前向性能已经比 TRITON_ATTN 快了，q8k 场景下快了 80%，而且直接能在 vllm 里跑起来。
+这个项目把 FlashAttention-2 移植到了 NVIDIA V100 (SM70) 上。目前前向性能已经比 TRITON_ATTN 快了，q8k 场景下快了 110%，而且直接能在 vllm 里跑起来。
 
-![FLASH_ATTN vs TRITON_ATTN Benchmark](assets/微信图片_20260329164253_102497_5.png)
+![FLASH_ATTN vs TRITON_ATTN Benchmark](assets/ScreenShot_2026-03-30_094543_270.png)
 
-![qwen3-coder-next on V100](assets/微信图片_20260329172146_102503_5.png)
+![qwen3-coder-next on V100](assets/ScreenShot_2026-03-30_100347_772.png)
 
 ## 使用方法
 
 ```bash
+git clone https://github.com/zhinianqin/flash-attention-v100.git
+cd flash-attention-v100
+
 uv venv --python 3.12
 source .venv/bin/activate
 uv pip install “cmake>=3.26.1” ninja “packaging>=24.2” “setuptools>=77.0.3,<81.0.0” wheel jinja2
@@ -52,9 +55,9 @@ I'm tired.
 
 This project ports FlashAttention-2 to NVIDIA V100 (SM70). The forward pass is now faster than TRITON_ATTN — 80% faster at q8k — and it runs directly with vllm.
 
-![FLASH_ATTN vs TRITON_ATTN Benchmark](assets/微信图片_20260329164253_102497_5.png)
+![FLASH_ATTN vs TRITON_ATTN Benchmark](assets/ScreenShot_2026-03-30_094543_270.png)
 
-![qwen3-coder-next on V100](assets/微信图片_20260329172146_102503_5.png)
+![qwen3-coder-next on V100](assets/ScreenShot_2026-03-30_100347_772.png)
 
 ## Usage
 
