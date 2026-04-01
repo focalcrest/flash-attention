@@ -43,6 +43,12 @@ vi /path/to/.venv/lib/python3.12/site-packages/vllm/v1/attention/backends/flash_
 
 然后正常启动 vllm 就可以了，默认会使用 FLASH_ATTN。
 
+**注意**：vllm 可能会自动安装原版 `flash_attn`，导致启动失败。如果遇到问题，请手动删除：
+
+```bash
+rm -rf /path/to/.venv/lib/python3.12/site-packages/flash_attn
+```
+
 ---
 
 希望有缘人继续优化吧，我爱你们。
@@ -90,6 +96,12 @@ Find the `supports_compute_capability` method and change the SM version check fr
 ```
 
 Then just start vllm normally — it will use FLASH_ATTN by default.
+
+**Note**: vllm may automatically install the original `flash_attn`, which can cause startup failures. If you run into issues, remove it manually:
+
+```bash
+rm -rf /path/to/.venv/lib/python3.12/site-packages/flash_attn
+```
 
 ---
 
