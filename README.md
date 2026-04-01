@@ -2,11 +2,11 @@
 
 我累了。
 
-这个项目把 FlashAttention-2 移植到了 NVIDIA V100 (SM70) 上。目前前向性能已经比 TRITON_ATTN 快了，q8k 场景下快了 110%，而且直接能在 vllm 里跑起来。
+这个项目把 FlashAttention-2 移植到了 NVIDIA V100 (SM70) 上。目前前向性能已经比 TRITON_ATTN 快了，q8k 场景下快了 320%，而且直接能在 vllm 里跑起来。
 
-![FLASH_ATTN vs TRITON_ATTN Benchmark](assets/ScreenShot_2026-03-30_094543_270.png)
+![FLASH_ATTN vs TRITON_ATTN Benchmark](assets/Perf__opt_Qwen3.5-27B_c1_2026-04-01_14_10_29.png)
 
-![qwen3-coder-next on V100](assets/ScreenShot_2026-03-30_100347_772.png)
+![qwen3-coder-next on V100](assets/ScreenShot_2026-04-01_201838_506.png)
 
 ## 使用方法
 
@@ -55,9 +55,9 @@ I'm tired.
 
 This project ports FlashAttention-2 to NVIDIA V100 (SM70). The forward pass is now faster than TRITON_ATTN — 80% faster at q8k — and it runs directly with vllm.
 
-![FLASH_ATTN vs TRITON_ATTN Benchmark](assets/ScreenShot_2026-03-30_094543_270.png)
+![FLASH_ATTN vs TRITON_ATTN Benchmark](assets/Perf__opt_Qwen3.5-27B_c1_2026-04-01_14_10_29.png)
 
-![qwen3-coder-next on V100](assets/ScreenShot_2026-03-30_100347_772.png)
+![qwen3-coder-next on V100](assets/ScreenShot_2026-04-01_201838_506.png)
 
 ## Usage
 
