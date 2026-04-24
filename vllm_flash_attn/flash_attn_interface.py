@@ -9,7 +9,7 @@ import torch.nn as nn
 # We need to import the CUDA kernels after importing torch
 # Use relative import to support build-from-source installation in vLLM
 
-from . import _vllm_fa2_C  # noqa: F401
+from . import _vllm_fa2_sm70_C  # noqa: F401
 
 # isort: on
 
@@ -202,7 +202,7 @@ def flash_attn_varlen_func(
             raise NotImplementedError("FA2 does not support s_aux")
         if num_splits > 1:
             raise NotImplementedError("FA2 does not support num_splits > 1")
-        out, softmax_lse = torch.ops._vllm_fa2_C.varlen_fwd(
+        out, softmax_lse = torch.ops._vllm_fa2_sm70_C.varlen_fwd(
             q, k, v,
             out,
             cu_seqlens_q,

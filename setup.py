@@ -288,7 +288,7 @@ def get_version() -> str:
     return version
 
 
-ext_modules.append(CMakeExtension(name="vllm_flash_attn._vllm_fa2_C"))
+ext_modules.append(CMakeExtension(name="vllm_flash_attn._vllm_fa2_sm70_C"))
 
 setup(
     name="vllm-flash-attn",
@@ -300,6 +300,10 @@ setup(
                                     "dist",
                                     "docs",
                                     "benchmarks",
+                                    "flash_attn",
+                                    "flash_attn.*",
+                                    "flash_attn_disabled",
+                                    "flash_attn_disabled.*",
                                     f"{PACKAGE_NAME}.egg-info",)),
     author="vLLM Team",
     description="Forward-only flash-attn",

@@ -98,7 +98,7 @@ if (FA2_ENABLED)
     endif()
 
     define_gpu_extension_target(
-        _vllm_fa2_C
+        _vllm_fa2_sm70_C
         DESTINATION vllm_flash_attn
         LANGUAGE ${VLLM_GPU_LANG}
         SOURCES
@@ -109,14 +109,14 @@ if (FA2_ENABLED)
         USE_SABI 3
         WITH_SOABI)
 
-    target_include_directories(_vllm_fa2_C PRIVATE
+    target_include_directories(_vllm_fa2_sm70_C PRIVATE
         csrc/flash_attn
         csrc/flash_attn/src
         csrc/common
         csrc/cutlass/include)
 
     # custom definitions
-    target_compile_definitions(_vllm_fa2_C PRIVATE
+    target_compile_definitions(_vllm_fa2_sm70_C PRIVATE
         FLASHATTENTION_DISABLE_BACKWARD
         FLASHATTENTION_DISABLE_DROPOUT
         # FLASHATTENTION_DISABLE_ALIBI

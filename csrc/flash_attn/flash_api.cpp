@@ -694,8 +694,9 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     params.page_block_size = page_block_size;
     // Keep references to these tensors to extend their lifetime
     at::Tensor softmax_lse_accum, out_accum;
-    if (seqlenq_ngroups_swapped) {
-        // Only apply split-k for decoding
+    if (seqlenq_ngroups_swapped || (paged_KV && num_splits > 1)) {
+        // Split-KV for decode (seqlenq_ngroups_swapped) or paged-KV prefill
+        // when num_splits > 1 is explicitly requested.
         std::tie(softmax_lse_accum, out_accum) =
             set_params_splitkv(params, batch_size, num_heads, head_size,
                                max_seqlen_k, max_seqlen_q, head_size_rounded,
