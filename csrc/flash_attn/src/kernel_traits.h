@@ -95,7 +95,7 @@ struct Copy_Traits<SM70_STG_GLOBAL_CG_128b> {
 
 using namespace cute;
 
-template<int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_>
+template<int kHeadDim_, int kBlockM_, int kBlockN_, int kCtaWarps_, int kMmaLayoutWarps_=kCtaWarps_>
 struct Flash_fwd_kernel_traits  {
     using Element = cutlass::half_t;
     using ElementAccum = float;
@@ -105,8 +105,10 @@ struct Flash_fwd_kernel_traits  {
     using SmemCopyAtomTransposed = Copy_Atom<DefaultCopy, Element>;
 
     // The number of threads.
-    static constexpr int kNWarps = kNWarps_;
-    static constexpr int kNThreads = kNWarps * 32;
+    static constexpr int kCtaWarps = kCtaWarps_;
+    static constexpr int kNWarps = kCtaWarps;
+    static constexpr int kNThreads = kCtaWarps * 32;
+    static constexpr int kMmaLayoutWarps = kMmaLayoutWarps_;
 
     static constexpr int kBlockM = kBlockM_;
     static constexpr int kBlockN = kBlockN_;
@@ -116,12 +118,14 @@ struct Flash_fwd_kernel_traits  {
     static constexpr int kBlockKGmem = kHeadDim % 128 == 0 ? 128 : (kHeadDim % 64 == 0 ? 64 : 32);
     static constexpr int kSwizzle = kBlockKSmem == 32 ? 2 : 3;
 
-    static_assert(kBlockM % kNWarps == 0, "warp-stationary requires blockM divisible by nWarps");
-    static constexpr int kWarpRows = kBlockM / kNWarps;
+    static_assert(kBlockM % kCtaWarps == 0, "warp-stationary requires blockM divisible by CTA warps");
+    static constexpr int kWarpRows = kBlockM / kCtaWarps;
+    static_assert(kWarpRows == 8 || kWarpRows == 16 || kWarpRows == 32 || kWarpRows == 64,
+                  "SM70 forward P-fragment conversion only supports kWarpRows == 8, 16, 32, or 64");
 
     using TiledMma = TiledMMA<
         MMA_Atom_Arch,
-        Layout<Shape<_1, Int<kNWarps>, _1>>,
+        Layout<Shape<_1, Int<kMmaLayoutWarps>, _1>>,
         Tile<Int<kWarpRows>, _16, _4>
     >;
     static constexpr int kMmaThreads = decltype(size(TiledMma{}))::value;
@@ -143,14 +147,10 @@ struct Flash_fwd_kernel_traits  {
         SmemLayoutAtomQ{},
         Shape<Int<kBlockN>, Int<kHeadDim>>{}));
 
-    // P is written as C-fragment and then read back as A-fragment in shared memory.
-    // Plain row-major layout creates heavy bank conflicts on SM70 for this transpose-like access.
-    // Swizzle the 8-row atom to spread accesses across banks.
-    static constexpr int kSwizzleP = kBlockN >= 64 ? 3 : 2;
-    using SmemLayoutAtomP = decltype(
-        composition(Swizzle<kSwizzleP, 3, 3>{},
-                    Layout<Shape<_8, Int<kBlockN>>,
-                           Stride<Int<kBlockN>, _1>>{}));
+    // Keep P in a simple row-major layout so the register-only C->A conversion can
+    // follow the logical coordinates directly without reasoning about a physical swizzle.
+    using SmemLayoutAtomP = Layout<Shape<_8, Int<kBlockN>>,
+                                   Stride<Int<kBlockN>, _1>>;
     using SmemLayoutP = decltype(tile_to_shape(
         SmemLayoutAtomP{},
         Shape<Int<kBlockM>, Int<kBlockN>>{}));
@@ -173,7 +173,8 @@ struct Flash_fwd_kernel_traits  {
     static constexpr int kSmemQSize = size(SmemLayoutQ{}) * sizeof(Element);
     static constexpr int kSmemKVSize = size(SmemLayoutKV{}) * 2 * sizeof(Element);
     static constexpr int kSmemPSize = size(SmemLayoutP{}) * sizeof(Element);
-    static constexpr int kSmemSize = kSmemQSize + kSmemKVSize + kSmemPSize;
+    static constexpr int kSmemSize = kSmemQSize + kSmemKVSize;
+    static_assert(kSmemSize <= 96 * 1024, "kSmemSize must fit within the 96KB shared memory limit on SM70");
 
     static constexpr int kGmemElemsPerLoad = sizeof(cute::uint128_t) / sizeof(Element);
     static_assert(kHeadDim % kGmemElemsPerLoad == 0, "kHeadDim must be a multiple of kGmemElemsPerLoad");
@@ -214,13 +215,13 @@ struct Flash_fwd_kernel_traits  {
                         GmemLayoutAtom{},
                         Layout<Shape<_1, _8>>{}));  // Val layout, 8 vals per store
 
-    using GmemLayoutAtomOaccum = std::conditional_t<
-        kBlockKSmem == 32,
-        Layout<Shape <_16, _8>,  // Thread layout, 8 threads per row
-               Stride< _8, _1>>,
-        Layout<Shape <_8, _16>,  // Thread layout, 16 threads per row
-               Stride< _16, _1>>
-    >;
+    static constexpr int kOaccumElemsPerAccess = sizeof(cute::uint128_t) / sizeof(ElementAccum);
+    static_assert(kBlockKSmem % kOaccumElemsPerAccess == 0, "kBlockKSmem must be divisible by the Oaccum vector width");
+    static constexpr int kOaccumThreadsPerRow = kBlockKSmem / kOaccumElemsPerAccess;
+    static_assert(kNThreads % kOaccumThreadsPerRow == 0, "kNThreads must be divisible by the Oaccum threads-per-row");
+    static constexpr int kOaccumRows = kNThreads / kOaccumThreadsPerRow;
+    using GmemLayoutAtomOaccum = Layout<Shape<Int<kOaccumRows>, Int<kOaccumThreadsPerRow>>,
+                                        Stride<Int<kOaccumThreadsPerRow>, _1>>;
     using SmemTiledCopyOaccumToReg = decltype(
         make_tiled_copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementAccum>{},
                         GmemLayoutAtomOaccum{},

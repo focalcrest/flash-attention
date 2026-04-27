@@ -1,12 +1,10 @@
-# FlashAttention V100 (SM70) 移植版
+### FlashAttention V100 (SM70) 移植版
 
-我累了。
+这个项目把 FlashAttention-2 移植到了 NVIDIA V100 (SM70) 上。目前前向性能已经比 `TRITON_ATTN` 快了，在 `q8k` 场景下快了 540%，而且直接能在 `vllm` 里跑起来。
 
-这个项目把 FlashAttention-2 移植到了 NVIDIA V100 (SM70) 上。目前前向性能已经比 TRITON_ATTN 快了，q8k 场景下快了 320%，而且直接能在 vllm 里跑起来。
+![V100 vLLM Screenshot](assets/ScreenShot_2026-04-05_143508_899.png)
 
-![FLASH_ATTN vs TRITON_ATTN Benchmark](assets/Perf__opt_Qwen3.5-27B_c1_2026-04-01_14_10_29.png)
-
-![qwen3-coder-next on V100](assets/ScreenShot_2026-04-01_201838_506.png)
+![Qwen3.5-27B q8k Performance](assets/Perf__opt_Qwen3.5-27B_c1_2026-04-05_08_03_48.png)
 
 ## 使用方法
 
@@ -16,17 +14,17 @@ cd flash-attention-v100
 
 uv venv --python 3.12
 source .venv/bin/activate
-uv pip install “cmake>=3.26.1” ninja “packaging>=24.2” “setuptools>=77.0.3,<81.0.0” wheel jinja2
+uv pip install "cmake>=3.26.1" ninja "packaging>=24.2" "setuptools>=77.0.3,<81.0.0" wheel jinja2
 uv pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu128
 
-# 安装vllm
+# 安装 vllm
 uv pip install vllm==0.17.1 --torch-backend=cu128
 
 # 构建安装
 ./build.sh
 ```
 
-安装完成后，需要修改 vllm 的 flash_attn backend，让它支持 SM70：
+安装完成后，需要修改 vllm 的 `flash_attn` backend，让它支持 SM70：
 
 ```bash
 vi /path/to/.venv/lib/python3.12/site-packages/vllm/v1/attention/backends/flash_attn.py
@@ -41,33 +39,19 @@ vi /path/to/.venv/lib/python3.12/site-packages/vllm/v1/attention/backends/flash_
 +        return capability >= DeviceCapability(7, 0)
 ```
 
-然后正常启动 vllm 就可以了，默认会使用 FLASH_ATTN。
+然后正常启动 vllm 即可，默认会使用 FLASH_ATTN。
 
-**注意**：vllm 可能会自动安装原版 `flash_attn`，导致启动失败。如果遇到问题，请手动删除：
 
-```bash
-rm -rf /path/to/.venv/lib/python3.12/site-packages/flash_attn
-```
+### FlashAttention V100 (SM70) Port
 
----
-
-希望有缘人继续优化吧，我爱你们。
-
----
-
-# FlashAttention V100 (SM70) Port
-
-I'm tired.
-
-This project ports FlashAttention-2 to NVIDIA V100 (SM70). The forward pass is now faster than TRITON_ATTN — 80% faster at q8k — and it runs directly with vllm.
-
-![FLASH_ATTN vs TRITON_ATTN Benchmark](assets/Perf__opt_Qwen3.5-27B_c1_2026-04-01_14_10_29.png)
-
-![qwen3-coder-next on V100](assets/ScreenShot_2026-04-01_201838_506.png)
+This project ports FlashAttention-2 to NVIDIA V100 (SM70). The forward path is already faster than `TRITON_ATTN`, shows a 540% improvement in the `q8k` case, and can run directly in `vllm`.
 
 ## Usage
 
 ```bash
+git clone https://github.com/zhinianqin/flash-attention-v100.git
+cd flash-attention-v100
+
 uv venv --python 3.12
 source .venv/bin/activate
 uv pip install "cmake>=3.26.1" ninja "packaging>=24.2" "setuptools>=77.0.3,<81.0.0" wheel jinja2
@@ -80,7 +64,7 @@ uv pip install vllm==0.17.1 --torch-backend=cu128
 ./build.sh
 ```
 
-After installation, patch vllm's flash_attn backend to support SM70:
+After installation, patch vllm's `flash_attn` backend to support SM70:
 
 ```bash
 vi /path/to/.venv/lib/python3.12/site-packages/vllm/v1/attention/backends/flash_attn.py
@@ -95,19 +79,114 @@ Find the `supports_compute_capability` method and change the SM version check fr
 +        return capability >= DeviceCapability(7, 0)
 ```
 
-Then just start vllm normally — it will use FLASH_ATTN by default.
+Then start vllm normally. It will use FLASH_ATTN by default.
 
-**Note**: vllm may automatically install the original `flash_attn`, which can cause startup failures. If you run into issues, remove it manually:
 
+### 1) 构建流程
+
+#### 推荐方式（项目内统一方式）
 ```bash
-rm -rf /path/to/.venv/lib/python3.12/site-packages/flash_attn
+./build.sh
 ```
 
----
+`build.sh` 已包含以下关键设置：
+- 激活 `.venv` 虚拟环境
+- 使用 `CUDA_HOME=/usr/local/cuda-12.8`
+- 开启 `ccache`，并设置上限 `100G`
+- 使用 `uv pip install --no-build-isolation . -v` 进行本地安装
 
-I hope someone out there will continue to optimize this. I love you all.
+### 2) 测试流程
 
----
+#### 通用回归入口
+```bash
+./test.sh
+```
+
+#### Dense 测试入口
+```bash
+./test_dense.sh
+.venv/bin/python tests/test_dense.py
+.venv/bin/python -m pytest -q tests/test_dense.py
+```
+
+#### 常用定点测试（建议用于 debug）
+```bash
+CASE_IDS=119 ./test_dense.sh
+CASE_IDS=183,184 ./test_dense.sh
+HEAD_DIMS=96 CASE_IDS=183 .venv/bin/python tests/test_dense.py
+HEAD_DIMS=32,64 .venv/bin/python -m pytest -q tests/test_dense.py
+```
+
+#### 测试说明
+- `./test.sh` 是仓库级的基础 pytest 入口，当前实际执行的是 `tests/test_flash_attn.py`。
+- 当你想快速确认通用 FlashAttention 行为没有回退时，优先使用 `./test.sh`。
+- 当你在排查 V100 / SM70 分支上的 dense 数值、split-kv 或不同 `head_dim` 组合问题时，使用 `test_dense.sh` / `tests/test_dense.py`。
+- `tests/test_dense.py` 现在同时支持脚本入口和 `pytest` 参数化入口，二者共用同一套执行逻辑。
+- `dense` 默认会对主测试矩阵覆盖 `head_dim = 32, 64, 96, 128, 192, 256`，并保留 smoke 回归与 split-kv 路径校验。
+- `HEAD_DIMS` 可用于选择 `head_dim` 子集，例如 `HEAD_DIMS=96` 或 `HEAD_DIMS=32,64,128`。
+- `CASE_IDS` 仍用于复现最小失败集，过滤顺序为先筛 case，再与 `HEAD_DIMS` 做组合。
+- 调试阶段建议先跑最小失败集（`CASE_IDS` + 必要的 `HEAD_DIMS`），确认后再回归全量。
+- 如需只检查收集结果，可执行 `.venv/bin/python -m pytest --collect-only -q tests/test_dense.py`。
+
+#### Dense test notes (English)
+- `./test.sh` is the lightweight repository-level regression entrypoint and currently runs `tests/test_flash_attn.py`.
+- Use `./test.sh` when you want a quick sanity check for the general FlashAttention path.
+- Use `test_dense.sh` / `tests/test_dense.py` when you specifically need V100 / SM70 dense validation, split-kv checks, or multi-`head_dim` coverage.
+- `tests/test_dense.py` now supports both the script entrypoint and parametrized `pytest` execution, backed by the same implementation logic.
+- By default, the dense matrix runs across `head_dim = 32, 64, 96, 128, 192, 256`, while still covering the smoke regression and split-kv path checks.
+- Use `HEAD_DIMS` to select a subset of head dimensions, for example `HEAD_DIMS=96` or `HEAD_DIMS=32,64,128`.
+- `CASE_IDS` still reproduces the minimal failing case set; filtering happens on cases first, then crosses with the selected `HEAD_DIMS`.
+- For debug loops, start with a small `CASE_IDS` / `HEAD_DIMS` slice and then expand to the full regression.
+- To inspect collection only, run `.venv/bin/python -m pytest --collect-only -q tests/test_dense.py`.
+
+### 3) 项目依赖
+
+### 硬件 / 系统
+- NVIDIA Tesla V100（计算能力 `sm_70`）
+- Linux 环境
+
+### CUDA / 编译工具
+- CUDA 12.8（路径约定：`/usr/local/cuda-12.8`）
+- `ccache`
+- `cmake >= 3.26.1`
+- `ninja`
+
+### Python / 包依赖
+- Python 虚拟环境：`.venv`
+- `uv`
+- `torch == 2.10.0`
+- `packaging >= 24.2`
+- `setuptools >= 77.0.3, < 81.0.0`
+- `wheel`, `jinja2`
+
+### 4) 测试状态
+
+以下为最近一次完整回归（2026-03-15）结果快照：
+
+**所有测试用例均已通过！**
+
+- `dense` 测试：全部通过
+- `splitkv` 测试：`60/60 PASS`
+
+项目已完成在 V100 (SM70) 上的 FA2 完整功能验证。
+
+### 5) Dense Test Coverage Notes (English)
+
+For the V100 / SM70 branch, dense regression is maintained in `tests/test_dense.py`.
+
+- Script mode: `.venv/bin/python tests/test_dense.py` or `./test_dense.sh`
+- Pytest mode: `.venv/bin/python -m pytest -q tests/test_dense.py`
+- Default coverage: every selected dense case is exercised with `head_dim = 32, 64, 96, 128, 192, 256`
+- Common selectors:
+  - `HEAD_DIMS=96`
+  - `HEAD_DIMS=32,64,128`
+  - `CASE_IDS=183`
+  - `DENSE_SUITE=numerical`
+- Example:
+
+```bash
+HEAD_DIMS=96 CASE_IDS=183 .venv/bin/python -m pytest -q tests/test_dense.py
+```
 
 This repository provides the official implementation of FlashAttention and
 FlashAttention-2 from the
