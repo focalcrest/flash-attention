@@ -538,8 +538,14 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
 
     auto q_dtype = q.dtype();
     TORCH_CHECK(q_dtype == torch::kFloat16, "FlashAttention only support fp16 data type");
-    TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype");
-    TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
+    // TQ mode: k/v are uint8 compressed cache, not fp16
+    const bool is_tq = k.dtype() == torch::kUInt8;
+    if (!is_tq) {
+        TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype");
+        TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
+    } else {
+        TORCH_CHECK(v.dtype() == torch::kUInt8, "TQ mode: value cache must be uint8");
+    }
     TORCH_CHECK(cu_seqlens_q.dtype() == torch::kInt32, "cu_seqlens_q must have dtype int32");
     TORCH_CHECK(cu_seqlens_k.dtype() == torch::kInt32, "cu_seqlens_k must have dtype int32");
 
@@ -557,8 +563,10 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     }
 
     TORCH_CHECK(q.stride(-1) == 1, "Input tensor must have contiguous last dimension");
-    TORCH_CHECK(k.stride(-1) == 1, "Input tensor must have contiguous last dimension");
-    TORCH_CHECK(v.stride(-1) == 1, "Input tensor must have contiguous last dimension");
+    if (!is_tq) {
+        TORCH_CHECK(k.stride(-1) == 1, "Input tensor must have contiguous last dimension");
+        TORCH_CHECK(v.stride(-1) == 1, "Input tensor must have contiguous last dimension");
+    }
     CHECK_CONTIGUOUS(cu_seqlens_q);
     CHECK_CONTIGUOUS(cu_seqlens_k);
 
@@ -604,12 +612,16 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
 
     CHECK_SHAPE(q, total_q, num_heads, head_size);
     if (!paged_KV) {
-        const int total_k = k.size(0);
-        CHECK_SHAPE(k, total_k, num_heads_k, head_size);
-        CHECK_SHAPE(v, total_k, num_heads_k, head_size);
+        if (!is_tq) {
+            const int total_k = k.size(0);
+            CHECK_SHAPE(k, total_k, num_heads_k, head_size);
+            CHECK_SHAPE(v, total_k, num_heads_k, head_size);
+        }
     } else {
-        CHECK_SHAPE(k, num_blocks, page_block_size, num_heads_k, head_size);
-        CHECK_SHAPE(v, num_blocks, page_block_size, num_heads_k, head_size);
+        if (!is_tq) {
+            CHECK_SHAPE(k, num_blocks, page_block_size, num_heads_k, head_size);
+            CHECK_SHAPE(v, num_blocks, page_block_size, num_heads_k, head_size);
+        }
         CHECK_SHAPE(block_table, batch_size, max_num_blocks_per_seq);
     }
 
@@ -692,6 +704,14 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
         params.v_batch_stride = v.stride(0);
     }
     params.page_block_size = page_block_size;
+
+    // TQ compressed KV cache params
+    if (is_tq) {
+        params.is_tq = true;
+        params.tq_slot_size = k.size(-1);                // 196 for k8v4
+        params.tq_val_data_bytes = head_size / 2;        // 4-bit packed: head_dim/2 bytes
+    }
+
     // Keep references to these tensors to extend their lifetime
     at::Tensor softmax_lse_accum, out_accum;
     if (seqlenq_ngroups_swapped || (paged_KV && num_splits > 1)) {
@@ -1247,8 +1267,14 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
 
     auto q_dtype = q.dtype();
     TORCH_CHECK(q_dtype == torch::kFloat16, "FlashAttention only support fp16 data type");
-    TORCH_CHECK(kcache.dtype() == q_dtype, "query and key must have the same dtype");
-    TORCH_CHECK(vcache.dtype() == q_dtype, "query and value must have the same dtype");
+    const bool is_tq = kcache.dtype() == torch::kUInt8;
+    if (!is_tq) {
+        TORCH_CHECK(kcache.dtype() == q_dtype, "query and key must have the same dtype");
+        TORCH_CHECK(vcache.dtype() == q_dtype, "query and value must have the same dtype");
+    } else {
+        TORCH_CHECK(kcache.dtype() == torch::kUInt8, "TQ key cache must be uint8");
+        TORCH_CHECK(vcache.dtype() == torch::kUInt8, "TQ value cache must be uint8");
+    }
 
     CHECK_DEVICE(q); CHECK_DEVICE(kcache); CHECK_DEVICE(vcache);
 
@@ -1305,16 +1331,20 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
 
     CHECK_SHAPE(q, batch_size, seqlen_q, num_heads, head_size_og);
     if (!paged_KV) {
-        CHECK_SHAPE(kcache, batch_size_c, seqlen_k, num_heads_k, head_size_og);
-        CHECK_SHAPE(vcache, batch_size_c, seqlen_k, num_heads_k, head_size_og);
+        if (!is_tq) {
+            CHECK_SHAPE(kcache, batch_size_c, seqlen_k, num_heads_k, head_size_og);
+            CHECK_SHAPE(vcache, batch_size_c, seqlen_k, num_heads_k, head_size_og);
+        }
     } else {
-        CHECK_SHAPE(kcache, num_blocks, page_block_size, num_heads_k, head_size_og);
-        CHECK_SHAPE(vcache, num_blocks, page_block_size, num_heads_k, head_size_og);
+        if (!is_tq) {
+            CHECK_SHAPE(kcache, num_blocks, page_block_size, num_heads_k, head_size_og);
+            CHECK_SHAPE(vcache, num_blocks, page_block_size, num_heads_k, head_size_og);
+        }
         CHECK_SHAPE(block_table, batch_size, max_num_blocks_per_seq);
     }
 
     at::Tensor q_padded, kcache_padded, vcache_padded;
-    if (head_size_og % 8 != 0) {
+    if (head_size_og % 8 != 0 && !is_tq) {
         q_padded = torch::nn::functional::pad(q, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
         kcache_padded = torch::nn::functional::pad(kcache, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
         vcache_padded = torch::nn::functional::pad(vcache, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
@@ -1468,6 +1498,14 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
         params.block_table_batch_stride = block_table.stride(0);
     }
     params.page_block_size = page_block_size;
+
+    // TQ compressed KV cache params
+    if (is_tq) {
+        params.is_tq = true;
+        params.tq_slot_size = kcache.size(3);    // last dim of uint8 cache (=196 for k8v4)
+        params.tq_val_data_bytes = params.tq_slot_size - head_size - 4;  // slot_size - key_bytes - scale - zero
+        params.hadamard_inv_ptr = nullptr;  // decode path doesn't need inverse Hadamard
+    }
 
 
     set_params_alibi(params, alibi_slopes_, batch_size, num_heads);

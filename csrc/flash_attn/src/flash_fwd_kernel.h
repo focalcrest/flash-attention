@@ -20,6 +20,7 @@
 #include "mask.h"
 #include "dropout.h"
 #include "rotary.h"
+#include "tq_dequant.h"
 
 namespace FLASH_NAMESPACE {
 
@@ -483,6 +484,114 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+// TQ (TurboQuant) compressed KV cache tile loader.
+// Reads a kBlockN x kHeadDim tile of TQ-compressed KV data and writes FP16 to smem.
+// For TQ, k_ptr/v_ptr point to uint8 cache with shape [num_pages, page_block_size, num_heads, slot_size].
+// Copy_K=true: load keys (FP8→FP16). Copy_K=false: load values (4-bit packed→FP16).
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <typename Kernel_traits, bool Copy_K, bool Is_even_MN, bool Is_even_K,
+          bool Clear_OOB_MN = false, typename SmemTensor>
+__forceinline__ __device__ void copy_tq_kv_tile(
+    const Flash_fwd_params &params,
+    const int *block_table,
+    int n_block,
+    int actual_seqlen_k,
+    int tidx,
+    int bidh,
+    int h_h_k_ratio,
+    SmemTensor& sKV)
+{
+    using Element = typename Kernel_traits::Element;
+    constexpr int kBlockN = Kernel_traits::kBlockN;
+    constexpr int kHeadDim = Kernel_traits::kHeadDim;
+    constexpr int kBlockKSmem = Kernel_traits::kBlockKSmem;
+    constexpr int kGmemThreadsPerRow = Kernel_traits::kGmemThreadsPerRow;
+    constexpr int kGmemRowsPerThread = Kernel_traits::kGmemRowsPerThread;
+    constexpr int kGmemElemsPerLoad = Kernel_traits::kGmemElemsPerLoad;
+    constexpr int kNumColTiles = kHeadDim / (kGmemThreadsPerRow * kGmemElemsPerLoad);
+
+    const int val_data_bytes = params.tq_val_data_bytes;
+    const int head_idx = bidh / h_h_k_ratio;
+
+    const uint8_t* tq_base = reinterpret_cast<const uint8_t*>(
+        Copy_K ? params.k_ptr : params.v_ptr);
+
+    const int col_group = tidx % kGmemThreadsPerRow;
+    const int row_group = tidx / kGmemThreadsPerRow;
+    const int row_start = row_group * kGmemRowsPerThread;
+
+    #pragma unroll
+    for (int local_row = 0; local_row < kGmemRowsPerThread; ++local_row) {
+        const int tile_row = row_start + local_row;
+        if (tile_row >= kBlockN) break;
+
+        const int global_row = n_block * kBlockN + tile_row;
+        const bool row_is_oob = !Is_even_MN && (global_row >= actual_seqlen_k);
+
+        if (row_is_oob) {
+            // Must zero ALL OOB rows (not just the first) because the MMA
+            // computes 0 * V for masked positions, and 0 * NaN = NaN.
+            #pragma unroll
+            for (int col_tile = 0; col_tile < kNumColTiles; ++col_tile) {
+                #pragma unroll
+                for (int c = 0; c < kGmemElemsPerLoad; ++c) {
+                    const int dim = col_tile * kBlockKSmem + col_group * kGmemElemsPerLoad + c;
+                    sKV(tile_row, dim) = Element(0.0f);
+                }
+            }
+            continue;
+        }
+
+        // Resolve page for this token row.
+        // TQ cache: [num_pages, page_block_size, num_heads, slot_size] dtype=uint8
+        // Strides in bytes: k_batch_stride, k_row_stride, k_head_stride
+        const int64_t virtual_page_idx = (int64_t)global_row / params.page_block_size;
+        const int64_t page_offset = (int64_t)global_row % params.page_block_size;
+        const int64_t physical_page = (int64_t)block_table[virtual_page_idx];
+
+        const uint8_t* slot_base = tq_base
+            + physical_page * params.k_batch_stride
+            + page_offset * params.k_row_stride
+            + head_idx * params.k_head_stride;
+
+        // For values, read scale/zero once per row
+        float scale_f = 0.0f, zero_f = 0.0f;
+        if constexpr (!Copy_K) {
+            const uint8_t* val_section = slot_base + kHeadDim;
+            half scale, zero;
+            tq_read_scale_zero(val_section, val_data_bytes, scale, zero);
+            scale_f = __half2float(scale);
+            zero_f = __half2float(zero);
+        }
+
+        #pragma unroll
+        for (int col_tile = 0; col_tile < kNumColTiles; ++col_tile) {
+            if constexpr (Copy_K) {
+                // KEY: FP8 → FP16
+                const uint8_t* key_data = slot_base;
+                #pragma unroll
+                for (int c = 0; c < kGmemElemsPerLoad; ++c) {
+                    const int dim = col_tile * kBlockKSmem + col_group * kGmemElemsPerLoad + c;
+                    sKV(tile_row, dim) = fp8e4b15_to_half(key_data[dim]);
+                }
+            } else {
+                // VALUE: 4-bit packed → FP16
+                const uint8_t* val_section = slot_base + kHeadDim;
+                #pragma unroll
+                for (int c = 0; c < kGmemElemsPerLoad; ++c) {
+                    const int dim = col_tile * kBlockKSmem + col_group * kGmemElemsPerLoad + c;
+                    uint8_t byte_val = val_section[dim >> 1];
+                    int nibble = (byte_val >> ((dim & 1) * 4)) & 0xF;
+                    float dequant = static_cast<float>(nibble) * scale_f + zero_f;
+                    sKV(tile_row, dim) = __float2half(dequant);
+                }
+            }
+        }
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template<typename Kernel_traits, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Split, bool Append_KV, typename Params>
 inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, const int bidb, const int bidh, const int m_block, const int n_split_idx, const int num_n_splits) {
@@ -636,7 +745,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     Tensor tVgV = make_tensor(tVgV_.data(), reshape_thread_tile(tVgV_.layout()));
     Tensor tVsV = make_tensor(tVsV_.data(), reshape_thread_tile(tVsV_.layout()));
 
-    if (block_table != nullptr) {
+    if (block_table != nullptr && !params.is_tq) {
         auto final_block_size = binfo.actual_seqlen_k - (n_block_max - 1) * kBlockN;
         tKgK.data() = gK.data() + flash::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block_max - 1, params.page_block_size,
             block_table, params.k_batch_stride, params.k_row_stride, final_block_size);
@@ -860,8 +969,13 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
     int n_block = n_block_max - 1;
     // We don't need to clear the sK smem tiles since we'll mask out the scores anyway.
-    FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_KV, tKgK, tKsK, tKVcKV, tKVpKV,
-                                                 binfo.actual_seqlen_k - n_block * kBlockN);
+    if (params.is_tq) {
+        copy_tq_kv_tile<Kernel_traits, /*Copy_K=*/true, Is_even_MN, Is_even_K>(
+            params, block_table, n_block, binfo.actual_seqlen_k, tidx, bidh, params.h_h_k_ratio, sK);
+    } else {
+        FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_KV, tKgK, tKsK, tKVcKV, tKVpKV,
+                                                     binfo.actual_seqlen_k - n_block * kBlockN);
+    }
 
     clear(acc_o);
 
@@ -888,7 +1002,15 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         __syncthreads();
 
         // Advance gV
-        if (masking_step > 0) {
+        if (params.is_tq) {
+            if (masking_step > 0) {
+                copy_tq_kv_tile<Kernel_traits, /*Copy_K=*/false, /*Is_even_MN=*/true, Is_even_K>(
+                    params, block_table, n_block, binfo.actual_seqlen_k, tidx, bidh, params.h_h_k_ratio, sV);
+            } else {
+                copy_tq_kv_tile<Kernel_traits, /*Copy_K=*/false, Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/true>(
+                    params, block_table, n_block, binfo.actual_seqlen_k, tidx, bidh, params.h_h_k_ratio, sV);
+            }
+        } else if (masking_step > 0) {
             if (block_table == nullptr) {
                 tVgV.data() = tVgV.data() + (-int(kBlockN * params.v_row_stride));
             } else {
@@ -922,13 +1044,18 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
         if (n_block > n_block_min) {
             // Advance gK
-            if (block_table == nullptr) {
-                tKgK.data() = tKgK.data() + (-int(kBlockN * params.k_row_stride));
+            if (params.is_tq) {
+                copy_tq_kv_tile<Kernel_traits, /*Copy_K=*/true, /*Is_even_MN=*/true, Is_even_K>(
+                    params, block_table, n_block - 1, binfo.actual_seqlen_k, tidx, bidh, params.h_h_k_ratio, sK);
             } else {
-                tKgK.data() = gK.data() + flash::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block - 1, params.page_block_size,
-                    block_table, params.k_batch_stride, params.k_row_stride);
+                if (block_table == nullptr) {
+                    tKgK.data() = tKgK.data() + (-int(kBlockN * params.k_row_stride));
+                } else {
+                    tKgK.data() = gK.data() + flash::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block - 1, params.page_block_size,
+                        block_table, params.k_batch_stride, params.k_row_stride);
+                }
+                FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_KV, tKgK, tKsK, tKVcKV, tKVpKV);
             }
-            FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_KV, tKgK, tKsK, tKVcKV, tKVpKV);
         }
 
         // We have key_padding_mask so we'll need to Check_inf
@@ -960,14 +1087,19 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         clear(acc_s);
         __syncthreads();
         // Advance gV
-        if (block_table == nullptr) {
-            tVgV.data() = tVgV.data() + (-int(kBlockN * params.v_row_stride));
+        if (params.is_tq) {
+            copy_tq_kv_tile<Kernel_traits, /*Copy_K=*/false, /*Is_even_MN=*/true, Is_even_K>(
+                params, block_table, n_block, binfo.actual_seqlen_k, tidx, bidh, params.h_h_k_ratio, sV);
         } else {
-            tVgV.data() = gV.data() + flash::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block, params.page_block_size,
-                block_table, params.v_batch_stride, params.v_row_stride);
-        }
+            if (block_table == nullptr) {
+                tVgV.data() = tVgV.data() + (-int(kBlockN * params.v_row_stride));
+            } else {
+                tVgV.data() = gV.data() + flash::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block, params.page_block_size,
+                    block_table, params.v_batch_stride, params.v_row_stride);
+            }
 
-        FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_KV, tVgV, tVsV, tKVcKV, tKVpKV);
+            FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_KV, tVgV, tVsV, tKVcKV, tKVpKV);
+        }
 
         FLASH_NAMESPACE::gemm(
             acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
@@ -980,13 +1112,18 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         __syncthreads();
         if (n_block > n_block_min) {
             // Advance gK
-            if (block_table == nullptr) {
-                tKgK.data() = tKgK.data() + (-int(kBlockN * params.k_row_stride));
+            if (params.is_tq) {
+                copy_tq_kv_tile<Kernel_traits, /*Copy_K=*/true, /*Is_even_MN=*/true, Is_even_K>(
+                    params, block_table, n_block - 1, binfo.actual_seqlen_k, tidx, bidh, params.h_h_k_ratio, sK);
             } else {
-                tKgK.data() = gK.data() + flash::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block - 1, params.page_block_size,
-                    block_table, params.k_batch_stride, params.k_row_stride);
+                if (block_table == nullptr) {
+                    tKgK.data() = tKgK.data() + (-int(kBlockN * params.k_row_stride));
+                } else {
+                    tKgK.data() = gK.data() + flash::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block - 1, params.page_block_size,
+                        block_table, params.k_batch_stride, params.k_row_stride);
+                }
+                FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_KV, tKgK, tKsK, tKVcKV, tKVpKV);
             }
-            FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_KV, tKgK, tKsK, tKVcKV, tKVpKV);
         }
 
         mask.template apply_mask</*Causal_mask=*/false>(

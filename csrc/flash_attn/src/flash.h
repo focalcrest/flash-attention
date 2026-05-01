@@ -140,6 +140,12 @@ struct Flash_fwd_params : public Qkv_params {
 
     bool unpadded_lse;  // For varlen paths: LSE is in [nheads, total_seqlen_q] format instead of [b, nheads, seqlen_q].
     bool seqlenq_ngroups_swapped;  // q has been transposed from (b, 1, (nheads_kv ngroups), d) to (b, ngroups, nheads_kv, d).
+
+    // TQ (TurboQuant) compressed KV cache support
+    bool is_tq;                              // true when using TQ compressed KV cache
+    int tq_slot_size;                        // bytes per head per token (196 for k8v4, head_dim=128)
+    int tq_val_data_bytes;                   // bytes for packed 4-bit value data (64 for head_dim=128)
+    void * __restrict__ hadamard_inv_ptr;    // D×D FP16 inverse Hadamard matrix (prefill only, decode=nullptr)
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
