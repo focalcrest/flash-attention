@@ -755,7 +755,10 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
 
     if (max_seqlen_k > 0) {
         auto stream = at::cuda::getCurrentCUDAStream().stream();
-        run_mha_fwd(params, stream, paged_KV);
+        // When TQ + prefill (seqlen_q > 1), use the prefill kernel instead of
+        // split-KV decode — same override as mha_fwd_kvcache.
+        const bool tq_prefill_varlen = is_tq && max_seqlen_q > 1;
+        run_mha_fwd(params, stream, /*force_split_kernel=*/!tq_prefill_varlen && paged_KV);
     } else {
         // If seqlen_k == 0, then we have an empty tensor. We need to set the output to 0.
         out.zero_();
