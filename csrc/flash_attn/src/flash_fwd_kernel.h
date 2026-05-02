@@ -32,6 +32,19 @@ using namespace cute;
 #define FLASHATTN_SM70_O_EPILOGUE_USE_CUTE_COPY 0
 #endif
 
+// Forward declaration — defined after compute_attn_1rowblock.
+template <typename Kernel_traits, bool Copy_K, bool Is_even_MN, bool Is_even_K,
+          bool Clear_OOB_MN = false, typename SmemTensor = void>
+__forceinline__ __device__ void copy_tq_kv_tile(
+    const Flash_fwd_params &params,
+    const int *block_table,
+    int n_block,
+    int actual_seqlen_k,
+    int tidx,
+    int bidh,
+    int h_h_k_ratio,
+    SmemTensor& sKV);
+
 template<typename ElementAccum, typename Params, int kBlockM, bool Is_even_MN>
 __forceinline__ __device__ auto get_lse_tile(const Params &params, const int bidb, const int bidh, const int m_block, const BlockInfo</*Varlen=*/!Is_even_MN> &binfo) {
         // When params.unpadded_lse is false, LSE is written as (b, h, seqlen_q) - this is non-variable seqlen path.
@@ -92,6 +105,12 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     const BlockInfo</*Varlen=*/!Is_even_MN> binfo(params, bidb);
     if (m_block * kBlockM >= binfo.actual_seqlen_q) return;
     const int rows_valid = binfo.actual_seqlen_q - m_block * kBlockM;
+
+    // Block table for paged TQ KV cache access
+    const int *block_table = nullptr;
+    if (params.is_tq && params.block_table != nullptr) {
+        block_table = params.block_table + bidb * params.block_table_batch_stride;
+    }
 
     const int n_block_min = !Is_local ? 0 : std::max(0, (m_block * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q - params.window_size_left) / kBlockN);
     int n_block_max = cute::ceil_div(binfo.actual_seqlen_k, kBlockN);
@@ -261,8 +280,13 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
     int n_block = n_block_max - 1;
     // We don't need to clear the sK smem tiles since we'll mask out the scores anyway.
-    FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tKgK(_, _, _, n_block), tKsK, tKVcKV, tKVpKV,
-                                       binfo.actual_seqlen_k - n_block * kBlockN);
+    if (params.is_tq) {
+        copy_tq_kv_tile<Kernel_traits, /*Copy_K=*/true, Is_even_MN, Is_even_K>(
+            params, block_table, n_block, binfo.actual_seqlen_k, tidx, bidh, params.h_h_k_ratio, sK);
+    } else {
+        FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tKgK(_, _, _, n_block), tKsK, tKVcKV, tKVpKV,
+                                           binfo.actual_seqlen_k - n_block * kBlockN);
+    }
 
     // Is_Q_in_regs == true
     /*
@@ -297,7 +321,15 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         __syncthreads();
 
         // Advance gV
-        if (masking_step > 0) {
+        if (params.is_tq) {
+            if (masking_step > 0) {
+                copy_tq_kv_tile<Kernel_traits, /*Copy_K=*/false, /*Is_even_MN=*/true, Is_even_K>(
+                    params, block_table, n_block, binfo.actual_seqlen_k, tidx, bidh, params.h_h_k_ratio, sV);
+            } else {
+                copy_tq_kv_tile<Kernel_traits, /*Copy_K=*/false, Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/true>(
+                    params, block_table, n_block, binfo.actual_seqlen_k, tidx, bidh, params.h_h_k_ratio, sV);
+            }
+        } else if (masking_step > 0) {
             FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV(_, _, _, n_block), tVsV, tKVcKV, tKVpKV);
         } else {
             // Clear the smem tiles to account for predicated off loads
@@ -321,7 +353,12 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
         __syncthreads();
         if (n_block > n_block_min) {
-            FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK(_, _, _, n_block - 1), tKsK, tKVcKV, tKVpKV);
+            if (params.is_tq) {
+                copy_tq_kv_tile<Kernel_traits, /*Copy_K=*/true, /*Is_even_MN=*/true, Is_even_K>(
+                    params, block_table, n_block - 1, binfo.actual_seqlen_k, tidx, bidh, params.h_h_k_ratio, sK);
+            } else {
+                FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK(_, _, _, n_block - 1), tKsK, tKVcKV, tKVpKV);
+            }
         }
 
         // TODO: when we have key_padding_mask we'll need to Check_inf
@@ -365,7 +402,12 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kWarpRows>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
         clear(acc_s);
         __syncthreads();
-        FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV(_, _, _, n_block), tVsV, tKVcKV, tKVpKV);
+        if (params.is_tq) {
+            copy_tq_kv_tile<Kernel_traits, /*Copy_K=*/false, /*Is_even_MN=*/true, Is_even_K>(
+                params, block_table, n_block, binfo.actual_seqlen_k, tidx, bidh, params.h_h_k_ratio, sV);
+        } else {
+            FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV(_, _, _, n_block), tVsV, tKVcKV, tKVpKV);
+        }
 
         FLASH_NAMESPACE::gemm</*A_in_regs=*/false>(
             acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
@@ -377,9 +419,14 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
         __syncthreads();
         if (n_block > n_block_min) {
-            FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK(_, _, _, n_block - 1), tKsK, tKVcKV, tKVpKV);
+            if (params.is_tq) {
+                copy_tq_kv_tile<Kernel_traits, /*Copy_K=*/true, /*Is_even_MN=*/true, Is_even_K>(
+                    params, block_table, n_block - 1, binfo.actual_seqlen_k, tidx, bidh, params.h_h_k_ratio, sK);
+            } else {
+                FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK(_, _, _, n_block - 1), tKsK, tKVcKV, tKVpKV);
+            }
         }
-        
+
         mask.template apply_mask</*Causal_mask=*/false>(
             acc_s, n_block * kBlockN, m_block * kBlockM + mma_group_id * kWarpRows, 0
         );
@@ -491,7 +538,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <typename Kernel_traits, bool Copy_K, bool Is_even_MN, bool Is_even_K,
-          bool Clear_OOB_MN = false, typename SmemTensor>
+          bool Clear_OOB_MN, typename SmemTensor>
 __forceinline__ __device__ void copy_tq_kv_tile(
     const Flash_fwd_params &params,
     const int *block_table,

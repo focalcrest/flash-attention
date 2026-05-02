@@ -1512,8 +1512,11 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
 
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     // Only split kernel supports appending to KV cache, or indexing to the cache with cache_batch_idx,
-    // or paged KV cache
-    run_mha_fwd(params, stream, /*force_split_kernel=*/k_.has_value() || cache_batch_idx_.has_value() || paged_KV);
+    // or paged KV cache.
+    // Exception: when using TQ compressed KV cache with multi-token Q (prefill continuation),
+    // use the prefill kernel for tiled Q processing instead of the split-KV decode kernel.
+    const bool tq_prefill = is_tq && seqlen_q > 1;
+    run_mha_fwd(params, stream, /*force_split_kernel=*/!tq_prefill && (k_.has_value() || cache_batch_idx_.has_value() || paged_KV));
 
     if (head_size_og % 8 != 0) {
         out = out.index({"...", torch::indexing::Slice(torch::indexing::None, head_size_og)});
