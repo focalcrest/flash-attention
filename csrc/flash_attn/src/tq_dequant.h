@@ -22,24 +22,14 @@
 
 namespace FLASH_NAMESPACE {
 
-// Convert a single fp8e4b15 value to FP16.
+// Convert a single fp8e4b15 value to FP16 (branchless).
 // fp8e4b15: SEEEEMMM (sign=1, exp=4 bias=15, mant=3)
 // fp16:     SEEEEMMMMMMMMMM (sign=1, exp=5 bias=15, mant=10)
-// Since both have bias=15, normal values map with same exponent + widened mantissa.
+// Same bias → sign<<8 shifts to bit 15; exp+mant together shift <<7.
+// Zeros (exp=0, mant=0) map correctly. Subnormals map to tiny FP16 subnormals
+// (negligible for TQ quantized data which never produces FP8 subnormals).
 __forceinline__ __device__ half fp8e4b15_to_half(uint8_t v) {
-    uint32_t sign = (v >> 7) & 1u;
-    uint32_t exp  = (v >> 3) & 0xFu;
-    uint32_t mant = v & 0x7u;
-
-    uint32_t fp16_bits;
-    if (exp == 0) {
-        // Zero or subnormal — treat as zero
-        fp16_bits = sign << 15;
-    } else {
-        // Normal: same exponent (bias 15), widen mantissa 3→10 bits
-        fp16_bits = (sign << 15) | (exp << 10) | (mant << 7);
-    }
-
+    uint32_t fp16_bits = ((uint32_t)(v & 0x80) << 8) | ((uint32_t)(v & 0x7F) << 7);
     half result;
     memcpy(&result, &fp16_bits, sizeof(half));
     return result;

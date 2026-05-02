@@ -577,22 +577,20 @@ __forceinline__ __device__ void copy_tq_kv_tile(
         const bool row_is_oob = !Is_even_MN && (global_row >= actual_seqlen_k);
 
         if (row_is_oob) {
-            // Must zero ALL OOB rows (not just the first) because the MMA
-            // computes 0 * V for masked positions, and 0 * NaN = NaN.
+            // Must zero ALL OOB rows because the MMA computes 0 * V for
+            // masked positions, and 0 * NaN = NaN.
             #pragma unroll
             for (int col_tile = 0; col_tile < kNumColTiles; ++col_tile) {
+                const int base_dim = col_tile * kBlockKSmem + col_group * kGmemElemsPerLoad;
                 #pragma unroll
                 for (int c = 0; c < kGmemElemsPerLoad; ++c) {
-                    const int dim = col_tile * kBlockKSmem + col_group * kGmemElemsPerLoad + c;
-                    sKV(tile_row, dim) = Element(0.0f);
+                    sKV(tile_row, base_dim + c) = Element(0.0f);
                 }
             }
             continue;
         }
 
         // Resolve page for this token row.
-        // TQ cache: [num_pages, page_block_size, num_heads, slot_size] dtype=uint8
-        // Strides in bytes: k_batch_stride, k_row_stride, k_head_stride
         const int64_t virtual_page_idx = (int64_t)global_row / params.page_block_size;
         const int64_t page_offset = (int64_t)global_row % params.page_block_size;
         const int64_t physical_page = (int64_t)block_table[virtual_page_idx];
@@ -602,36 +600,42 @@ __forceinline__ __device__ void copy_tq_kv_tile(
             + page_offset * params.k_row_stride
             + head_idx * params.k_head_stride;
 
-        // For values, read scale/zero once per row
-        float scale_f = 0.0f, zero_f = 0.0f;
-        if constexpr (!Copy_K) {
+        if constexpr (Copy_K) {
+            // KEY: FP8 → FP16, vectorized load + branchless convert + vectorized write
+            const uint8_t* key_data = slot_base;
+            #pragma unroll
+            for (int col_tile = 0; col_tile < kNumColTiles; ++col_tile) {
+                const int base_dim = col_tile * kBlockKSmem + col_group * kGmemElemsPerLoad;
+                // Load 8 FP8 bytes in one 64-bit transaction
+                uint64_t fp8_vec;
+                memcpy(&fp8_vec, key_data + base_dim, sizeof(uint64_t));
+                // Convert and write 8 FP16 values
+                #pragma unroll
+                for (int c = 0; c < kGmemElemsPerLoad; ++c) {
+                    sKV(tile_row, base_dim + c) = fp8e4b15_to_half(
+                        reinterpret_cast<const uint8_t*>(&fp8_vec)[c]);
+                }
+            }
+        } else {
+            // VALUE: 4-bit packed → FP16, vectorized load + batch nibble unpack
             const uint8_t* val_section = slot_base + kHeadDim;
             half scale, zero;
             tq_read_scale_zero(val_section, val_data_bytes, scale, zero);
-            scale_f = __half2float(scale);
-            zero_f = __half2float(zero);
-        }
+            const float scale_f = __half2float(scale);
+            const float zero_f = __half2float(zero);
 
-        #pragma unroll
-        for (int col_tile = 0; col_tile < kNumColTiles; ++col_tile) {
-            if constexpr (Copy_K) {
-                // KEY: FP8 → FP16
-                const uint8_t* key_data = slot_base;
+            #pragma unroll
+            for (int col_tile = 0; col_tile < kNumColTiles; ++col_tile) {
+                const int base_dim = col_tile * kBlockKSmem + col_group * kGmemElemsPerLoad;
+                // Load 4 packed bytes (8 nibbles) in one 32-bit transaction
+                const int byte_offset = base_dim >> 1;
+                uint32_t packed;
+                memcpy(&packed, val_section + byte_offset, sizeof(uint32_t));
                 #pragma unroll
                 for (int c = 0; c < kGmemElemsPerLoad; ++c) {
-                    const int dim = col_tile * kBlockKSmem + col_group * kGmemElemsPerLoad + c;
-                    sKV(tile_row, dim) = fp8e4b15_to_half(key_data[dim]);
-                }
-            } else {
-                // VALUE: 4-bit packed → FP16
-                const uint8_t* val_section = slot_base + kHeadDim;
-                #pragma unroll
-                for (int c = 0; c < kGmemElemsPerLoad; ++c) {
-                    const int dim = col_tile * kBlockKSmem + col_group * kGmemElemsPerLoad + c;
-                    uint8_t byte_val = val_section[dim >> 1];
-                    int nibble = (byte_val >> ((dim & 1) * 4)) & 0xF;
+                    int nibble = (packed >> (c * 4)) & 0xF;
                     float dequant = static_cast<float>(nibble) * scale_f + zero_f;
-                    sKV(tile_row, dim) = __float2half(dequant);
+                    sKV(tile_row, base_dim + c) = __float2half(dequant);
                 }
             }
         }
