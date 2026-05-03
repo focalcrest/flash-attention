@@ -529,7 +529,10 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
                const float softcap,
                const bool return_softmax,
                int num_splits,
-               std::optional<at::Generator> gen_) {
+               std::optional<at::Generator> gen_,
+               std::optional<at::Tensor> &k_raw_,
+               std::optional<at::Tensor> &v_raw_,
+               std::optional<at::Tensor> &tq_cached_lens_) {
 
     // Otherwise the kernel will be launched from cuda:0 device
     at::cuda::CUDAGuard device_guard{q.device()};
@@ -710,6 +713,29 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
         params.is_tq = true;
         params.tq_slot_size = k.size(-1);                // 196 for k8v4
         params.tq_val_data_bytes = head_size / 2;        // 4-bit packed: head_dim/2 bytes
+    }
+
+    // Hybrid TQ + raw FP16 K/V for continuation prefill
+    if (k_raw_.has_value()) {
+        auto k_raw = k_raw_.value();
+        auto v_raw = v_raw_.value();
+        TORCH_CHECK(k_raw.dtype() == torch::kFloat16, "k_raw must be fp16");
+        TORCH_CHECK(v_raw.dtype() == torch::kFloat16, "v_raw must be fp16");
+        TORCH_CHECK(k_raw.stride(-1) == 1, "k_raw must have contiguous last dim");
+        TORCH_CHECK(v_raw.stride(-1) == 1, "v_raw must have contiguous last dim");
+        params.k_raw_ptr = k_raw.data_ptr();
+        params.v_raw_ptr = v_raw.data_ptr();
+        params.k_raw_row_stride = k_raw.stride(-3);
+        params.k_raw_head_stride = k_raw.stride(-2);
+        params.v_raw_row_stride = v_raw.stride(-3);
+        params.v_raw_head_stride = v_raw.stride(-2);
+    }
+    if (tq_cached_lens_.has_value()) {
+        auto tq_cached_lens = tq_cached_lens_.value();
+        TORCH_CHECK(tq_cached_lens.dtype() == torch::kInt32, "tq_cached_lens must be int32");
+        TORCH_CHECK(tq_cached_lens.is_contiguous(), "tq_cached_lens must be contiguous");
+        TORCH_CHECK((int)tq_cached_lens.size(0) == batch_size, "tq_cached_lens size must match batch_size");
+        params.tq_cached_lens = tq_cached_lens.data_ptr<int>();
     }
 
     // Keep references to these tensors to extend their lifetime

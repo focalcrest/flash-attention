@@ -146,6 +146,17 @@ struct Flash_fwd_params : public Qkv_params {
     int tq_slot_size;                        // bytes per head per token (196 for k8v4, head_dim=128)
     int tq_val_data_bytes;                   // bytes for packed 4-bit value data (64 for head_dim=128)
     void * __restrict__ hadamard_inv_ptr;    // D×D FP16 inverse Hadamard matrix (prefill only, decode=nullptr)
+
+    // Hybrid TQ + raw FP16 K/V for continuation prefill.
+    // Cached tokens (0..tq_cached_lens[b]-1) are read from TQ paged cache;
+    // current-chunk tokens (tq_cached_lens[b]..seq_len-1) are read from raw FP16.
+    int * __restrict__ tq_cached_lens;       // per-batch cached token count
+    void * __restrict__ k_raw_ptr;           // raw FP16 keys [total_raw_tokens, h_k, d]
+    void * __restrict__ v_raw_ptr;           // raw FP16 values [total_raw_tokens, h_k, d]
+    index_t k_raw_row_stride;
+    index_t k_raw_head_stride;
+    index_t v_raw_row_stride;
+    index_t v_raw_head_stride;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

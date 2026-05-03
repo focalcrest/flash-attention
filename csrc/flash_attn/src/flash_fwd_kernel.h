@@ -32,7 +32,7 @@ using namespace cute;
 #define FLASHATTN_SM70_O_EPILOGUE_USE_CUTE_COPY 0
 #endif
 
-// Forward declaration — defined after compute_attn_1rowblock.
+// Forward declarations — defined after compute_attn_1rowblock.
 template <typename Kernel_traits, bool Copy_K, bool Is_even_MN, bool Is_even_K,
           bool Clear_OOB_MN = false, typename SmemTensor = void>
 __forceinline__ __device__ void copy_tq_kv_tile(
@@ -40,6 +40,20 @@ __forceinline__ __device__ void copy_tq_kv_tile(
     const int *block_table,
     int n_block,
     int actual_seqlen_k,
+    int tidx,
+    int bidh,
+    int h_h_k_ratio,
+    SmemTensor& sKV);
+
+template <typename Kernel_traits, bool Copy_K, bool Is_even_MN, bool Is_even_K,
+          bool Clear_OOB_MN = false, typename SmemTensor = void>
+__forceinline__ __device__ void copy_hybrid_boundary_tile(
+    const Flash_fwd_params &params,
+    const int *block_table,
+    int n_block,
+    int actual_seqlen_k,
+    int cached_len,
+    int raw_kv_row_offset,
     int tidx,
     int bidh,
     int h_h_k_ratio,
@@ -111,6 +125,16 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     if (params.is_tq && params.block_table != nullptr) {
         block_table = params.block_table + bidb * params.block_table_batch_stride;
     }
+
+    // Hybrid TQ + raw FP16 K/V for continuation prefill.
+    // Tiles with rows < tq_cached_len use TQ dequant; tiles with rows >= tq_cached_len
+    // use raw FP16 async copy. At most one tile straddles the boundary.
+    const int tq_cached_len = (params.is_tq && params.tq_cached_lens)
+        ? params.tq_cached_lens[bidb] : 0;
+    const bool is_hybrid = tq_cached_len > 0 && params.k_raw_ptr != nullptr;
+    const int n_block_raw_start = cute::ceil_div(tq_cached_len, kBlockN);
+    const bool has_boundary = is_hybrid && (tq_cached_len % kBlockN != 0);
+    const int boundary_n_block = tq_cached_len / kBlockN;
 
     const int n_block_min = !Is_local ? 0 : std::max(0, (m_block * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q - params.window_size_left) / kBlockN);
     int n_block_max = cute::ceil_div(binfo.actual_seqlen_k, kBlockN);
@@ -217,6 +241,34 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     Tensor tVgV = gmem_thr_copy_QKV.partition_S(gV);  // (VCPY, VCPY_N, VCPY_K, nblocksN)
     Tensor tVsV = gmem_thr_copy_QKV.partition_D(sV);
 
+    // Raw FP16 K/V gmem tensors for hybrid mode.
+    // Raw K/V has same token layout as Q: cu_seqlens_q[bidb] gives the row offset.
+    // local_tile index for raw tiles: n_block - n_block_raw_start.
+    Tensor tKgK_raw = tKgK;  // placeholder, overwritten when is_hybrid
+    Tensor tVgV_raw = tVgV;
+    const int raw_kv_row_offset = binfo.sum_s_q;
+    if (is_hybrid) {
+        Tensor mK_raw = make_tensor(
+            make_gmem_ptr(reinterpret_cast<Element*>(params.k_raw_ptr)
+                          + (index_t)raw_kv_row_offset * params.k_raw_row_stride),
+            make_shape(binfo.actual_seqlen_q, params.h_k, params.d),
+            make_stride(params.k_raw_row_stride, params.k_raw_head_stride, _1{}));
+        Tensor gK_raw = local_tile(mK_raw(_, bidh / params.h_h_k_ratio, _),
+                                   Shape<Int<kBlockN>, Int<kHeadDim>>{},
+                                   make_coord(_, 0));
+        tKgK_raw = gmem_thr_copy_QKV.partition_S(gK_raw);
+
+        Tensor mV_raw = make_tensor(
+            make_gmem_ptr(reinterpret_cast<Element*>(params.v_raw_ptr)
+                          + (index_t)raw_kv_row_offset * params.v_raw_row_stride),
+            make_shape(binfo.actual_seqlen_q, params.h_k, params.d),
+            make_stride(params.v_raw_row_stride, params.v_raw_head_stride, _1{}));
+        Tensor gV_raw = local_tile(mV_raw(_, bidh / params.h_h_k_ratio, _),
+                                   Shape<Int<kBlockN>, Int<kHeadDim>>{},
+                                   make_coord(_, 0));
+        tVgV_raw = gmem_thr_copy_QKV.partition_S(gV_raw);
+    }
+
     typename Kernel_traits::TiledMma tiled_mma;
     auto thr_mma = tiled_mma.get_thread_slice(mma_thread_id);
     Tensor tSrQ  = thr_mma.partition_fragment_A(sQ_warp);                   // (MMA,MMA_M,MMA_K)
@@ -280,7 +332,15 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
     int n_block = n_block_max - 1;
     // We don't need to clear the sK smem tiles since we'll mask out the scores anyway.
-    if (params.is_tq) {
+    if (is_hybrid && n_block >= n_block_raw_start) {
+        const int raw_n = n_block - n_block_raw_start;
+        FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tKgK_raw(_, _, _, raw_n), tKsK, tKVcKV, tKVpKV,
+                                           binfo.actual_seqlen_k - n_block * kBlockN);
+    } else if (has_boundary && n_block == boundary_n_block) {
+        copy_hybrid_boundary_tile<Kernel_traits, /*Copy_K=*/true, Is_even_MN, Is_even_K>(
+            params, block_table, n_block, binfo.actual_seqlen_k, tq_cached_len, raw_kv_row_offset,
+            tidx, bidh, params.h_h_k_ratio, sK);
+    } else if (params.is_tq) {
         copy_tq_kv_tile<Kernel_traits, /*Copy_K=*/true, Is_even_MN, Is_even_K>(
             params, block_table, n_block, binfo.actual_seqlen_k, tidx, bidh, params.h_h_k_ratio, sK);
     } else {
@@ -321,7 +381,25 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         __syncthreads();
 
         // Advance gV
-        if (params.is_tq) {
+        if (is_hybrid && n_block >= n_block_raw_start) {
+            const int raw_n = n_block - n_block_raw_start;
+            if (masking_step > 0) {
+                FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV_raw(_, _, _, raw_n), tVsV, tKVcKV, tKVpKV);
+            } else {
+                FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/true>(
+                    gmem_tiled_copy_QKV, tVgV_raw(_, _, _, raw_n), tVsV, tKVcKV, tKVpKV, binfo.actual_seqlen_k - n_block * kBlockN);
+            }
+        } else if (has_boundary && n_block == boundary_n_block) {
+            if (masking_step > 0) {
+                copy_hybrid_boundary_tile<Kernel_traits, /*Copy_K=*/false, /*Is_even_MN=*/true, Is_even_K>(
+                    params, block_table, n_block, binfo.actual_seqlen_k, tq_cached_len, raw_kv_row_offset,
+                    tidx, bidh, params.h_h_k_ratio, sV);
+            } else {
+                copy_hybrid_boundary_tile<Kernel_traits, /*Copy_K=*/false, Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/true>(
+                    params, block_table, n_block, binfo.actual_seqlen_k, tq_cached_len, raw_kv_row_offset,
+                    tidx, bidh, params.h_h_k_ratio, sV);
+            }
+        } else if (params.is_tq) {
             if (masking_step > 0) {
                 copy_tq_kv_tile<Kernel_traits, /*Copy_K=*/false, /*Is_even_MN=*/true, Is_even_K>(
                     params, block_table, n_block, binfo.actual_seqlen_k, tidx, bidh, params.h_h_k_ratio, sV);
@@ -332,7 +410,6 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         } else if (masking_step > 0) {
             FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV(_, _, _, n_block), tVsV, tKVcKV, tKVpKV);
         } else {
-            // Clear the smem tiles to account for predicated off loads
             FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/true>(
                 gmem_tiled_copy_QKV, tVgV(_, _, _, n_block), tVsV, tKVcKV, tKVpKV, binfo.actual_seqlen_k - n_block * kBlockN
             );
@@ -353,11 +430,18 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
         __syncthreads();
         if (n_block > n_block_min) {
-            if (params.is_tq) {
+            const int nb = n_block - 1;
+            if (is_hybrid && nb >= n_block_raw_start) {
+                FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK_raw(_, _, _, nb - n_block_raw_start), tKsK, tKVcKV, tKVpKV);
+            } else if (has_boundary && nb == boundary_n_block) {
+                copy_hybrid_boundary_tile<Kernel_traits, /*Copy_K=*/true, /*Is_even_MN=*/true, Is_even_K>(
+                    params, block_table, nb, binfo.actual_seqlen_k, tq_cached_len, raw_kv_row_offset,
+                    tidx, bidh, params.h_h_k_ratio, sK);
+            } else if (params.is_tq) {
                 copy_tq_kv_tile<Kernel_traits, /*Copy_K=*/true, /*Is_even_MN=*/true, Is_even_K>(
-                    params, block_table, n_block - 1, binfo.actual_seqlen_k, tidx, bidh, params.h_h_k_ratio, sK);
+                    params, block_table, nb, binfo.actual_seqlen_k, tidx, bidh, params.h_h_k_ratio, sK);
             } else {
-                FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK(_, _, _, n_block - 1), tKsK, tKVcKV, tKVpKV);
+                FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK(_, _, _, nb), tKsK, tKVcKV, tKVpKV);
             }
         }
 
@@ -402,7 +486,14 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kWarpRows>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
         clear(acc_s);
         __syncthreads();
-        if (params.is_tq) {
+        if (is_hybrid && n_block >= n_block_raw_start) {
+            const int raw_n = n_block - n_block_raw_start;
+            FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV_raw(_, _, _, raw_n), tVsV, tKVcKV, tKVpKV);
+        } else if (has_boundary && n_block == boundary_n_block) {
+            copy_hybrid_boundary_tile<Kernel_traits, /*Copy_K=*/false, /*Is_even_MN=*/true, Is_even_K>(
+                params, block_table, n_block, binfo.actual_seqlen_k, tq_cached_len, raw_kv_row_offset,
+                tidx, bidh, params.h_h_k_ratio, sV);
+        } else if (params.is_tq) {
             copy_tq_kv_tile<Kernel_traits, /*Copy_K=*/false, /*Is_even_MN=*/true, Is_even_K>(
                 params, block_table, n_block, binfo.actual_seqlen_k, tidx, bidh, params.h_h_k_ratio, sV);
         } else {
@@ -419,11 +510,18 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
         __syncthreads();
         if (n_block > n_block_min) {
-            if (params.is_tq) {
+            const int nb = n_block - 1;
+            if (is_hybrid && nb >= n_block_raw_start) {
+                FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK_raw(_, _, _, nb - n_block_raw_start), tKsK, tKVcKV, tKVpKV);
+            } else if (has_boundary && nb == boundary_n_block) {
+                copy_hybrid_boundary_tile<Kernel_traits, /*Copy_K=*/true, /*Is_even_MN=*/true, Is_even_K>(
+                    params, block_table, nb, binfo.actual_seqlen_k, tq_cached_len, raw_kv_row_offset,
+                    tidx, bidh, params.h_h_k_ratio, sK);
+            } else if (params.is_tq) {
                 copy_tq_kv_tile<Kernel_traits, /*Copy_K=*/true, /*Is_even_MN=*/true, Is_even_K>(
-                    params, block_table, n_block - 1, binfo.actual_seqlen_k, tidx, bidh, params.h_h_k_ratio, sK);
+                    params, block_table, nb, binfo.actual_seqlen_k, tidx, bidh, params.h_h_k_ratio, sK);
             } else {
-                FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK(_, _, _, n_block - 1), tKsK, tKVcKV, tKVpKV);
+                FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK(_, _, _, nb), tKsK, tKVcKV, tKVpKV);
             }
         }
 
@@ -636,6 +734,137 @@ __forceinline__ __device__ void copy_tq_kv_tile(
                     int nibble = (packed >> (c * 4)) & 0xF;
                     float dequant = static_cast<float>(nibble) * scale_f + zero_f;
                     sKV(tile_row, base_dim + c) = __float2half(dequant);
+                }
+            }
+        }
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Hybrid boundary tile loader — handles tiles that straddle the TQ/raw boundary.
+// Rows with global_row < cached_len read from TQ paged cache (dequantize).
+// Rows with global_row >= cached_len read from raw FP16 (direct copy).
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <typename Kernel_traits, bool Copy_K, bool Is_even_MN, bool Is_even_K,
+          bool Clear_OOB_MN, typename SmemTensor>
+__forceinline__ __device__ void copy_hybrid_boundary_tile(
+    const Flash_fwd_params &params,
+    const int *block_table,
+    int n_block,
+    int actual_seqlen_k,
+    int cached_len,
+    int raw_kv_row_offset,
+    int tidx,
+    int bidh,
+    int h_h_k_ratio,
+    SmemTensor& sKV)
+{
+    using Element = typename Kernel_traits::Element;
+    constexpr int kBlockN = Kernel_traits::kBlockN;
+    constexpr int kHeadDim = Kernel_traits::kHeadDim;
+    constexpr int kBlockKSmem = Kernel_traits::kBlockKSmem;
+    constexpr int kGmemThreadsPerRow = Kernel_traits::kGmemThreadsPerRow;
+    constexpr int kGmemRowsPerThread = Kernel_traits::kGmemRowsPerThread;
+    constexpr int kGmemElemsPerLoad = Kernel_traits::kGmemElemsPerLoad;
+    constexpr int kNumColTiles = kHeadDim / (kGmemThreadsPerRow * kGmemElemsPerLoad);
+
+    const int val_data_bytes = params.tq_val_data_bytes;
+    const int head_idx = bidh / h_h_k_ratio;
+
+    const uint8_t* tq_base = reinterpret_cast<const uint8_t*>(
+        Copy_K ? params.k_ptr : params.v_ptr);
+    const Element* raw_base = reinterpret_cast<const Element*>(
+        Copy_K ? params.k_raw_ptr : params.v_raw_ptr);
+    const int64_t raw_row_stride = Copy_K ? params.k_raw_row_stride : params.v_raw_row_stride;
+    const int64_t raw_head_stride = Copy_K ? params.k_raw_head_stride : params.v_raw_head_stride;
+
+    const int col_group = tidx % kGmemThreadsPerRow;
+    const int row_group = tidx / kGmemThreadsPerRow;
+    const int row_start = row_group * kGmemRowsPerThread;
+
+    #pragma unroll
+    for (int local_row = 0; local_row < kGmemRowsPerThread; ++local_row) {
+        const int tile_row = row_start + local_row;
+        if (tile_row >= kBlockN) break;
+
+        const int global_row = n_block * kBlockN + tile_row;
+        const bool row_is_oob = !Is_even_MN && (global_row >= actual_seqlen_k);
+
+        if (row_is_oob) {
+            if (Clear_OOB_MN) {
+                #pragma unroll
+                for (int col_tile = 0; col_tile < kNumColTiles; ++col_tile) {
+                    const int base_dim = col_tile * kBlockKSmem + col_group * kGmemElemsPerLoad;
+                    #pragma unroll
+                    for (int c = 0; c < kGmemElemsPerLoad; ++c) {
+                        sKV(tile_row, base_dim + c) = Element(0.0f);
+                    }
+                }
+            }
+            continue;
+        }
+
+        if (global_row < cached_len) {
+            // TQ path: read from paged cache and dequantize
+            const int64_t virtual_page_idx = (int64_t)global_row / params.page_block_size;
+            const int64_t page_offset = (int64_t)global_row % params.page_block_size;
+            const int64_t physical_page = (int64_t)block_table[virtual_page_idx];
+
+            const uint8_t* slot_base = tq_base
+                + physical_page * params.k_batch_stride
+                + page_offset * params.k_row_stride
+                + head_idx * params.k_head_stride;
+
+            if constexpr (Copy_K) {
+                const uint8_t* key_data = slot_base;
+                #pragma unroll
+                for (int col_tile = 0; col_tile < kNumColTiles; ++col_tile) {
+                    const int base_dim = col_tile * kBlockKSmem + col_group * kGmemElemsPerLoad;
+                    uint64_t fp8_vec;
+                    memcpy(&fp8_vec, key_data + base_dim, sizeof(uint64_t));
+                    #pragma unroll
+                    for (int c = 0; c < kGmemElemsPerLoad; ++c) {
+                        sKV(tile_row, base_dim + c) = fp8e4b15_to_half(
+                            reinterpret_cast<const uint8_t*>(&fp8_vec)[c]);
+                    }
+                }
+            } else {
+                const uint8_t* val_section = slot_base + kHeadDim;
+                half scale, zero;
+                tq_read_scale_zero(val_section, val_data_bytes, scale, zero);
+                const float scale_f = __half2float(scale);
+                const float zero_f = __half2float(zero);
+                #pragma unroll
+                for (int col_tile = 0; col_tile < kNumColTiles; ++col_tile) {
+                    const int base_dim = col_tile * kBlockKSmem + col_group * kGmemElemsPerLoad;
+                    const int byte_offset = base_dim >> 1;
+                    uint32_t packed;
+                    memcpy(&packed, val_section + byte_offset, sizeof(uint32_t));
+                    #pragma unroll
+                    for (int c = 0; c < kGmemElemsPerLoad; ++c) {
+                        int nibble = (packed >> (c * 4)) & 0xF;
+                        float dequant = static_cast<float>(nibble) * scale_f + zero_f;
+                        sKV(tile_row, base_dim + c) = __float2half(dequant);
+                    }
+                }
+            }
+        } else {
+            // Raw FP16 path: direct read from raw K/V tensor
+            const int raw_row = raw_kv_row_offset + (global_row - cached_len);
+            const Element* raw_row_ptr = raw_base
+                + (int64_t)raw_row * raw_row_stride
+                + (int64_t)head_idx * raw_head_stride;
+
+            #pragma unroll
+            for (int col_tile = 0; col_tile < kNumColTiles; ++col_tile) {
+                const int base_dim = col_tile * kBlockKSmem + col_group * kGmemElemsPerLoad;
+                #pragma unroll
+                for (int c = 0; c < kGmemElemsPerLoad; ++c) {
+                    const int d = base_dim + c;
+                    if (Is_even_K || d < kHeadDim) {
+                        sKV(tile_row, d) = raw_row_ptr[d];
+                    }
                 }
             }
         }
