@@ -1201,6 +1201,7 @@ class FlashAttentionForwardSm100:
                     num_splits,
                     SeqlenInfoCls,
                     mma_tile_coord_v,
+                    blocksparse_tensors=blocksparse_tensors,
                     tile_scheduler=tile_scheduler,
                 )
 
@@ -1488,6 +1489,8 @@ class FlashAttentionForwardSm100:
                     batch_idx,
                     head_idx,
                     m_block,
+                    split_idx,
+                    num_splits,
                     kv_producer_state,
                     load_Q,
                     load_K,
@@ -1635,6 +1638,8 @@ class FlashAttentionForwardSm100:
                     batch_idx,
                     head_idx,
                     m_block,
+                    split_idx,
+                    num_splits,
                     self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
                     self.q_subtile_factor if self.q_subtile_factor is not None else 1,
                 )
@@ -2001,6 +2006,8 @@ class FlashAttentionForwardSm100:
                     batch_idx,
                     head_idx,
                     m_block,
+                    split_idx,
+                    num_splits,
                     self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
                     self.q_subtile_factor if self.q_subtile_factor is not None else 1,
                 )
@@ -2058,6 +2065,8 @@ class FlashAttentionForwardSm100:
                     batch_idx,
                     head_idx,
                     m_block,
+                    split_idx,
+                    num_splits,
                     softmax_step,
                     mask_fn,
                     mask_fn_none,
@@ -2413,6 +2422,8 @@ class FlashAttentionForwardSm100:
                     batch_idx,
                     head_idx,
                     m_block,
+                    split_idx,
+                    num_splits,
                     self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
                     self.q_subtile_factor if self.q_subtile_factor is not None else 1,
                 )
@@ -2826,6 +2837,7 @@ class FlashAttentionForwardSm100:
         num_splits: int,
         SeqlenInfoCls: Callable,
         mma_tile_coord_v: Int32 = 0,
+        blocksparse_tensors: Optional[BlockSparseTensors] = None,
         tile_scheduler=None,
     ):
         epi_consumer_phase = Int32(0)
@@ -2834,8 +2846,9 @@ class FlashAttentionForwardSm100:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
             n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, split_idx, num_splits)
+            has_work = const_expr(self.use_block_sparsity or not self.is_split_kv) or n_block_min < n_block_max
 
-            if const_expr(not self.is_split_kv) or n_block_min < n_block_max:
+            if has_work:
                 if const_expr(self.is_split_kv):
                     mO_cur = seqlen.offset_batch_Q(mO, batch_idx, dim=3)[None, None, head_idx, split_idx]
                 else:

@@ -612,10 +612,6 @@ def _flash_attn_fwd(
         # NB: pack_gqa requires block sparse head dim == 1 (broadcasted)
         if pack_gqa and block_sparse_tensors.mask_block_cnt.shape[1] != 1:
             pack_gqa = False
-        if is_split_kv:
-            raise NotImplementedError(
-                "Block sparsity is not yet supported with SplitKV. TODO: partition sparse block lists per split."
-            )
 
     # See get_broadcast_dims for why this is needed in compile key
     block_sparse_broadcast_pattern = None
